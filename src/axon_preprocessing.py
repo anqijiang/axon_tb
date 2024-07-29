@@ -23,12 +23,7 @@ from scipy.optimize import curve_fit
 from scipy.stats import weibull_min
 from scipy.signal import savgol_filter
 from ruptures.base import BaseCost
-
-
-# global variables, double check these match your data
 from scipy.sparse import csr_matrix
-
-# noinspection PyProtectedMember
 from scipy.sparse.csgraph._traversal import connected_components
 
 from sklearn.cluster import KMeans
@@ -40,6 +35,7 @@ from sklearn.cluster import AgglomerativeClustering
 import ruptures as rpt
 import re
 import numpy.ma as ma
+import ast
 
 fig_path = 'D:\\Axon\\Methods paper'
 data_path = 'D:\\Axon\\Analysis'
@@ -62,17 +58,28 @@ def load_axon(animal, day):
     return raw
 
 
-def save_axon(grouped_mat, group_map, save_path):
+def load_red(animal, day):
+
+    save_path = os.path.join(data_path, animal, day)
+    red_path = os.path.join(save_path, 'suite2p', 'plane0', 'F_chan2.npy')
+    if os.path.exists(red_path):
+        raw_red = np.load(red_path)
+        return raw_red
+    else:
+        return None
+
+
+def save_axon(grouped_mat, group_map, save_path, save_name):
 
     print(f'saving to {save_path}')
 
     df = pd.DataFrame(grouped_mat.transpose(), columns=[f'{n}' for n in range(grouped_mat.shape[0])])
-    df.to_csv(os.path.join(save_path, 'grouped_axons.csv'))
+    df.to_csv(os.path.join(save_path, f'grouped_axons_{save_name}.csv'))
 
-    with open(os.path.join(save_path, 'group_map.pickle'), "wb") as output_file:
+    with open(os.path.join(save_path, f'group_map_{save_name}.pickle'), "wb") as output_file:
         pickle.dump(group_map, output_file)
 
-    print('saved!')
+    print(f'{save_name} saved!')
 
 
 def smoothing(raw, raw_red=None, window_size = 10):
@@ -314,6 +321,8 @@ class AxonImaging:
 
         raw = load_axon(self.animal, self.day)
         self._load_beh_params()
+        assert raw.shape[1] == self._beh_params['switch_frame'][-1], f'{self.path}: imaging and beh file frames do not match'
+
         raw_dict = dict(zip(self.env, np.split(raw, self._beh_params['switch_frame'], axis=1)[:-1]))
         proc_dict = {}
 
@@ -338,6 +347,17 @@ class AxonImaging:
         if proc_dict is None:
             proc_dict = self._load_dict()
 
+        raw_red = load_red(self.animal, self.day)
+        if raw_red is not None:
+            frames = np.cumsum([proc_dict[env]['data'].shape[1] for env in self.env])
+            assert raw_red.shape[1] == frames[-1], "red and green file not matched"
+            if len(frames) > 1:
+                red_dict = dict(zip(self.env, np.split(raw_red, frames[:-1], axis=1)))
+            else:
+                red_dict ={self.env[0]: raw_red}
+        else:
+            red_dict = None
+
         for env in proc_dict:
             data = proc_dict[env]['data']
             rois = proc_dict[env]['roi']
@@ -346,38 +366,52 @@ class AxonImaging:
             z1 = pca.fit_transform(z_data.transpose())
 
             plt.plot(z1)
-            plt.title(f'{self.animal} {self.day} in {env} PCA 1st component')
+            plt.title(f'{self.animal} {self.day} in {env} PCA 1st component: no drifts')
+            # plt.savefig(os.path.join(self.path, f'{self.animal}_{self.day}_{env}_ROI_PCA.png'))
             plt.show()
 
-            n_breakpoints = int(input(f"{self.animal} {self.day} in {env} # breakpoints to find"))
+            if red_dict is not None:
+                z_data_red = scipy.stats.zscore(red_dict[env], axis=1)
+                z_red = pca.fit_transform(z_data_red.transpose())
+                z1 = np.hstack((z1, z_red))
+                plt.plot(z_red)
+                plt.title(f'{self.animal} {self.day} in {env} PCA 1st component red channel: no drifts')
+                plt.show()
 
-            if n_breakpoints>0:
+            n_breakpoints = int(input(f"{self.animal} {self.day} in {env} # breakpoints to find"))
+            verified = 0
+
+            while (verified != 1) & (n_breakpoints>0):
 
                 algo_binseg = model.fit(z1)
                 optimal_change_points = algo_binseg.predict(n_bkps=n_breakpoints)
                 print(optimal_change_points)
                 outlier_indices = find_short_intervals(optimal_change_points, thresh=max_drift_frames)
-                rpt.display(z1, optimal_change_points)
-                #plt.plot(outlier_indices, [0]*len(outlier_indices), color='black', linewidth=3)
-                plt.title(f'{self.animal} {self.day} in {env} {n_breakpoints} breakpoints')
-                plt.savefig(os.path.join(self.path, f'{self.animal}_{self.day}_{env}_ROI_PCA.svg'))
-                plt.show()
+
                 print(outlier_indices)
 
                 for n in range(plot_n):
                     rpt.display(z_data[n, :], optimal_change_points)
                     plt.title(f'cell {rois[n]}: {n_breakpoints} breakpoints')
-                    plt.savefig(os.path.join(self.path, f'{self.animal}_{self.day}_{env}_roi{rois[n]}.svg'))
+                    plt.savefig(os.path.join(self.path, f'{self.animal}_{self.day}_{env}_roi{rois[n]}.png'))
                     plt.show()
 
-                verified = int(input(f"are breakpoints reasonable in {self.animal} {self.day} in {env}? 0: no, 1: yes"))
+                rpt.display(z1, optimal_change_points)
+                # plt.plot(outlier_indices, [0]*len(outlier_indices), color='black', linewidth=3)
+                plt.title(f'{self.animal} {self.day} in {env} {n_breakpoints} breakpoints')
+                plt.savefig(os.path.join(self.path, f'{self.animal}_{self.day}_{env}_ROI_PCA.png'))
+                plt.show()
 
-                if verified == 1:
+                verified = ast.literal_eval(input(f"are {outlier_indices} reasonable in {self.animal} {self.day} in {env}? 0: no, 1: yes"))
+                if type(verified) is list:
+                    proc_dict[env]['del frames'] = verified
+                    self._save_dict(proc_dict)
+                    verified = 1
+                elif verified == 1:
                     proc_dict[env]['del frames'] = outlier_indices
                     self._save_dict(proc_dict)
-
                 else:
-                    print(f'user interrupt: {self.animal} {self.day} in {env}')
+                    n_breakpoints = int(input(f"{self.animal} {self.day} in {env} # breakpoints to find"))
 
         return proc_dict
 
@@ -428,7 +462,7 @@ class AxonImaging:
             data = proc_data['data'][rois, :]
 
             if 'del frames' in proc_data:
-                print(f'found frames to delete in {self.animal} {self.day} {self.env}')
+                print(f'found frames to delete in {self.animal} {self.day} {env}')
                 #del_frames = proc_data['del frames']
                 del_frames = np.hstack([np.arange(n[0], n[1]) for n in proc_data['del frames']])
                 data = np.delete(data, np.unique(del_frames), axis=1)
@@ -444,19 +478,20 @@ class AxonImaging:
 
         final_mat = np.hstack(final_data_list)
 
-        if len(self.env) == 1:
+        if len(self.env) > 0:  # ==1:
+            m = 'h_cluster'
             combined_mat, group_map = self._group_by_cluster(final_mat, corr_thresh=corr_thresh)
         elif len(self.env) > 1:
+            m = 'corr'
             combined_mat, group_map = self._group_by_corr(final_mat, corr_thresh=corr_thresh)
         else:
             print(f'error {self.animal} {self.day}')
-
 
         if len(deleted_frames)>0:
             deleted_frames = np.hstack(deleted_frames)
             combined_mat = np.insert(combined_mat, deleted_frames-np.arange(len(deleted_frames)), np.nan, axis=1)
 
-        save_axon(combined_mat, group_map, self.path)
+        save_axon(combined_mat, group_map, self.path, f'{m}_{corr_thresh}')
 
         df = self._add_behavior(combined_mat)
 
@@ -550,8 +585,7 @@ class AxonImaging:
 
         active_rois = np.where(np.sum(final_mat, axis=1) > 0)[0]
         cov_nov = np.corrcoef(final_mat[active_rois, :])
-        n_comp, group_ids = connected_components(csr_matrix(cov_nov > corr_thresh), directed=False,
-                                                 return_labels=True)
+        n_comp, group_ids = connected_components(csr_matrix(cov_nov > corr_thresh), directed=False, return_labels=True)
         combined_mat, group_map = group_columns(final_mat[active_rois, :], n_comp, group_ids, active_rois)
 
         return combined_mat, group_map
